@@ -5,6 +5,12 @@
 成功返回发票号、各行金额与总额（均为整数分）；任何核验失败返回 `422`，
 错误体带**段序号**与**错误码**。
 
+另提供 `POST /v1/issue-810`：由**结构化发票数据**（交换收发方、日期时间、
+控制号、发票号与 1～100 行明细）生成 ASC X12 004010 **810 报文**，分隔符
+固定为 `*` / `:` / `~`，ISA 段固定 106 字节，控制号两两配对、段数计数自洽，
+逐行按 `ROUND_HALF_UP` 取整数分合计写入 `TDS01`；生成的报文不超过 64 KiB
+且保证可通过 `/v1/verify`。
+
 另提供 `POST /v1/reconcile`：给定一张采购单，对 1～50 份发票报文按输入顺序
 逐张核销（逐张核验、行号/单价比对、数量累计），返回逐张接受状态与各采购单行
 剩余数量。
@@ -38,6 +44,7 @@ docker compose up --build -d
 
 - 服务地址：`http://localhost:8080`
 - 核验接口：`POST http://localhost:8080/v1/verify`
+- 报文生成：`POST http://localhost:8080/v1/issue-810`
 - 核销接口：`POST http://localhost:8080/v1/reconcile`
 - 回执生成：`POST http://localhost:8080/v1/acknowledge`
 - 回执状态解析：`POST http://localhost:8080/v1/ack-status`
@@ -93,6 +100,108 @@ docker compose up --build -d
 curl -s http://localhost:8080/v1/verify \
   -H 'Content-Type: application/json' \
   -d '{"edi_text": "ISA*00*          *00*          *ZZ*SENDER123456789*ZZ*RECEIVER1234567*000830*1200*U*00401*000000001*0*P*:~GS*IN*S*R*20200830*1200*42*X*004010~ST*810*0001~BIG*20200830*INV1~IT1*1*10*EA*19.99~TDS*19990~SE*5*0001~GE*1*42~IEA*1*000000001~"}'
+```
+
+## 请求 / 响应（POST /v1/issue-810）
+
+由**结构化发票数据**生成 ASC X12 004010 **810 报文**。分隔符固定为元素 `*`、
+组件 `:`、段终止符 `~`；ISA 段固定 106 字节（`ISA06`/`ISA08` 右侧补空格至
+15 字符）。控制号两两配对（`ISA13=IEA02`、`GS06=GE02`、`ST02=SE02`），
+`SE01` 为 ST..SE（含两端）段数，`GE01`/`IEA01` 均为 1；`TDS01` 为逐行
+`ROUND_HALF_UP` 取整后的整数分合计（N2 隐含两位小数）。生成的报文不超过
+**64 KiB**，且返回前经与 `/v1/verify` 完全相同的核验自检，保证可再提交
+`/v1/verify`、`/v1/inbox`、`/v1/acknowledge` 等接口。
+
+请求体（JSON）：
+
+```json
+{
+  "isa05": "ZZ", "isa06": "SENDER123456789",
+  "isa07": "ZZ", "isa08": "RECEIVER1234567",
+  "isa09": "000830", "isa10": "1200", "isa13": "000000001",
+  "gs02": "SENDERGS", "gs03": "RECVGS",
+  "gs04": "20200830", "gs05": "1200", "gs06": "42",
+  "st02": "0001",
+  "big01": "20200830", "big02": "INV-2020-0830",
+  "lines": [
+    {"it101": "1", "it102": "10", "it104": "19.99"},
+    {"it101": "2", "it102": "3",  "it104": "0.05"}
+  ]
+}
+```
+
+字段约束（所有字段均须为**纯 ASCII**，且不得包含分隔符 `*` `:` `~` 或控制字符）：
+
+| 字段 | 约束 |
+| --- | --- |
+| `isa05` / `isa07` | 恰好 2 字符 |
+| `isa06` / `isa08` | 1～15 字符（生成时右侧补空格至 15） |
+| `isa09` | 6 位数字 `YYMMDD`，合法日历日期 |
+| `isa10` | 4 位数字 `HHMM`，合法时间 |
+| `isa13` | 恰好 9 位数字 |
+| `gs02` / `gs03` | 1～15 字符 |
+| `gs04` / `big01` | 8 位数字 `CCYYMMDD`，合法日历日期 |
+| `gs05` | 4/6/8 位数字 `HHMM[SS[DD]]`，合法时间 |
+| `gs06` / `st02` | 1～9 字符 |
+| `big02` | 1～22 字符 |
+| `lines` | 1～100 行 |
+| `lines[].it101` | 1～20 字符，全局唯一 |
+| `lines[].it102` | 十进制正数，至多 3 位小数，≤15 字符 |
+| `lines[].it104` | 十进制非负，至多 4 位小数，≤17 字符 |
+
+成功 `200`（`total_amount` 为 TDS01 整数分）：
+
+```json
+{
+  "edi_text": "ISA*00*          *00*          *ZZ*SENDER123456789*ZZ*RECEIVER1234567*000830*1200*U*00401*000000001*0*P*:~GS*IN*SENDERGS*RECVGS*20200830*1200*42*X*004010~ST*810*0001~BIG*20200830*INV-2020-0830~IT1*1*10*EA*19.99~IT1*2*3*EA*0.05~TDS*20005~SE*6*0001~GE*1*42~IEA*1*000000001~",
+  "total_amount": 20005
+}
+```
+
+失败 `422`（`field` 为请求字段名；行内字段形如 `lines[1].it101`，下标从 0 开始）：
+
+```json
+{
+  "error": {
+    "code": "IT101_DUPLICATE",
+    "message": "IT101 行号重复: '1'",
+    "field": "lines[1].it101"
+  }
+}
+```
+
+### 生成错误码（422）
+
+| code | 含义 |
+| --- | --- |
+| `NOT_ASCII` | 字段含非 ASCII 字符 |
+| `FIELD_EMPTY` / `FIELD_TOO_SHORT` / `FIELD_TOO_LONG` | 字段为空 / 短于下限 / 超出长度上限 |
+| `SEPARATOR_INJECTION` | 字段含分隔符（`*` `:` `~`）或控制字符 |
+| `ISA13_INVALID` | ISA13 不是恰好 9 位数字 |
+| `DATE_INVALID` / `TIME_INVALID` | 日期（ISA09/GS04/BIG01）或时间（ISA10/GS05）非法 |
+| `LINES_EMPTY` / `LINES_TOO_MANY` | 发票行数为 0 / 超过 100 |
+| `IT101_DUPLICATE` | IT101 行号重复 |
+| `IT102_INVALID` / `IT104_INVALID` | 数量非正或小数超 3 位 / 单价为负或小数超 4 位（或格式非法） |
+| `PAYLOAD_TOO_LARGE` | 生成的报文超过 64 KiB（正常字段上限下不会触发） |
+
+调用示例：
+
+```bash
+curl -s http://localhost:8080/v1/issue-810 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "isa05": "ZZ", "isa06": "SENDER123456789",
+    "isa07": "ZZ", "isa08": "RECEIVER1234567",
+    "isa09": "000830", "isa10": "1200", "isa13": "000000001",
+    "gs02": "SENDERGS", "gs03": "RECVGS",
+    "gs04": "20200830", "gs05": "1200", "gs06": "42",
+    "st02": "0001",
+    "big01": "20200830", "big02": "INV-2020-0830",
+    "lines": [
+      {"it101": "1", "it102": "10", "it104": "19.99"},
+      {"it101": "2", "it102": "3",  "it104": "0.05"}
+    ]
+  }'
 ```
 
 ## 请求 / 响应（POST /v1/reconcile）
@@ -533,11 +642,13 @@ pytest -q
 ```
 app/main.py        FastAPI 路由、请求/响应模型、422/409/404 异常处理
 app/verifier.py    ISA 分隔符解析、外壳状态机、整数定点金额核验
+app/issuer.py      结构化发票校验与 004010 X12 810 报文生成（固定 * : ~ 分隔符）
 app/reconciler.py  采购单校验与多发票逐张核销（整数毫单位，无浮点）
 app/acknowledger.py 外壳可回执性提取与 004010 X12 997 回执生成
 app/ack_status.py  发送清单校验与 004010 X12 997 回执状态解析（A/R/U 推断）
 app/inbox.py       收件键/业务指纹计算与 SQLite 幂等收件库
 tests/test_verify.py      /v1/verify 端到端/单元测试（39 个）
+tests/test_issue_810.py   /v1/issue-810 端到端测试（23 个）
 tests/test_reconcile.py   /v1/reconcile 端到端测试（25 个）
 tests/test_acknowledge.py /v1/acknowledge 端到端测试（19 个）
 tests/test_ack_status.py  /v1/ack-status 端到端测试（48 个）

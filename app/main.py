@@ -1,4 +1,4 @@
-"""X12 810 发票核验、采购单核销、997 功能回执生成与 997 状态解析 HTTP API。"""
+"""X12 810 发票核验、报文生成、采购单核销、997 功能回执生成与 997 状态解析 HTTP API。"""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from .inbox import (
     inbox_key,
     receipt_id_for,
 )
+from .issuer import IssueError, issue
 from .reconciler import (
     MAX_EDI_TEXTS,
     OrderError,
@@ -31,8 +32,9 @@ from .verifier import Invoice, X12Error, verify_text
 
 app = FastAPI(
     title="X12 810 Invoice Verification API",
-    version="1.4.0",
+    version="1.5.0",
     description="核验 ASC X12 004010 单份 810 发票报文的外壳结构与发票金额，"
+                "由结构化发票数据生成 004010 X12 810 报文，"
                 "按采购单对多份发票逐张核销，对单份 810 生成 997 功能回执，"
                 "按发送清单解析 997 回执中各交易集的接受状态，"
                 "并提供基于 SQLite 的幂等收件库（重发识别与冲突检测）。",
@@ -79,6 +81,20 @@ async def order_error_handler(_request, exc: OrderError) -> JSONResponse:
     )
 
 
+@app.exception_handler(IssueError)
+async def issue_error_handler(_request, exc: IssueError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+                "field": exc.field,
+            }
+        },
+    )
+
+
 @app.exception_handler(InboxConflict)
 async def inbox_conflict_handler(_request, exc: InboxConflict) -> JSONResponse:
     return JSONResponse(
@@ -115,6 +131,63 @@ async def verify_invoice(req: VerifyRequest) -> VerifyResponse:
         ],
         total_amount=invoice.total_amount,
     )
+
+
+# ---------- POST /v1/issue-810 ----------
+
+
+class IssueLineInModel(BaseModel):
+    it101: str = Field(..., description="IT101 行号（1～20 字符，全局唯一）")
+    it102: str = Field(
+        ..., description="IT102 数量（十进制字符串，正，至多 3 位小数，≤15 字符）")
+    it104: str = Field(
+        ..., description="IT104 单价（十进制字符串，非负，至多 4 位小数，≤17 字符）")
+
+
+class IssueRequest(BaseModel):
+    isa05: str = Field(..., description="ISA05 交换发送方限定符（恰好 2 字符）")
+    isa06: str = Field(
+        ..., description="ISA06 交换发送方标识（1～15 字符，右侧补空格至 15）")
+    isa07: str = Field(..., description="ISA07 交换接收方限定符（恰好 2 字符）")
+    isa08: str = Field(
+        ..., description="ISA08 交换接收方标识（1～15 字符，右侧补空格至 15）")
+    isa09: str = Field(..., description="ISA09 交换日期（YYMMDD，6 位数字）")
+    isa10: str = Field(..., description="ISA10 交换时间（HHMM，4 位数字）")
+    isa13: str = Field(..., description="ISA13 交换控制号（恰好 9 位数字）")
+    gs02: str = Field(..., description="GS02 应用发送方代码（1～15 字符）")
+    gs03: str = Field(..., description="GS03 应用接收方代码（1～15 字符）")
+    gs04: str = Field(..., description="GS04 功能组日期（CCYYMMDD，8 位数字）")
+    gs05: str = Field(
+        ..., description="GS05 功能组时间（HHMM[SS[DD]]，4/6/8 位数字）")
+    gs06: str = Field(..., description="GS06 组控制号（1～9 字符）")
+    st02: str = Field(..., description="ST02 交易集控制号（1～9 字符）")
+    big01: str = Field(..., description="BIG01 发票日期（CCYYMMDD，8 位数字）")
+    big02: str = Field(..., description="BIG02 发票号（1～22 字符）")
+    lines: list[IssueLineInModel] = Field(
+        ..., description="1～100 行发票行（IT101/IT102/IT104）")
+
+
+class IssueResponse(BaseModel):
+    edi_text: str = Field(
+        ..., description="ASC X12 004010 810 报文（分隔符 * : ~，ISA 106 字节，"
+                         "可通过 /v1/verify）")
+    total_amount: int = Field(..., description="TDS01 总额，整数分")
+
+
+@app.post(
+    "/v1/issue-810",
+    response_model=IssueResponse,
+    summary="由结构化发票数据生成 ASC X12 004010 810 报文",
+)
+async def issue_810(req: IssueRequest) -> IssueResponse:
+    edi_text, total_amount = issue(
+        isa05=req.isa05, isa06=req.isa06, isa07=req.isa07, isa08=req.isa08,
+        isa09=req.isa09, isa10=req.isa10, isa13=req.isa13,
+        gs02=req.gs02, gs03=req.gs03, gs04=req.gs04, gs05=req.gs05,
+        gs06=req.gs06, st02=req.st02, big01=req.big01, big02=req.big02,
+        lines=req.lines,
+    )
+    return IssueResponse(edi_text=edi_text, total_amount=total_amount)
 
 
 # ---------- POST /v1/inbox、GET /v1/inbox/{receipt_id} ----------
