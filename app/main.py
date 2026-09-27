@@ -1,4 +1,4 @@
-"""X12 810 发票核验、采购单核销、997 功能回执生成与 997 状态解析 HTTP API。"""
+"""X12 810 发票核验、采购单核销、997 功能回执生成与 997 状态解析、810 开具 HTTP API。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,9 @@ import os
 import threading
 from typing import Literal, Optional
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -20,6 +22,7 @@ from .inbox import (
     inbox_key,
     receipt_id_for,
 )
+from .issuer import IssueError, IssueLine, issue_810
 from .reconciler import (
     MAX_EDI_TEXTS,
     OrderError,
@@ -31,10 +34,11 @@ from .verifier import Invoice, X12Error, verify_text
 
 app = FastAPI(
     title="X12 810 Invoice Verification API",
-    version="1.4.0",
+    version="1.5.0",
     description="核验 ASC X12 004010 单份 810 发票报文的外壳结构与发票金额，"
                 "按采购单对多份发票逐张核销，对单份 810 生成 997 功能回执，"
                 "按发送清单解析 997 回执中各交易集的接受状态，"
+                "将结构化发票开具为 004010 X12 810 报文，"
                 "并提供基于 SQLite 的幂等收件库（重发识别与冲突检测）。",
 )
 
@@ -92,6 +96,57 @@ async def receipt_not_found_handler(_request, exc: ReceiptNotFound) -> JSONRespo
     return JSONResponse(
         status_code=404,
         content={"error": {"code": exc.code, "message": exc.message}},
+    )
+
+
+@app.exception_handler(IssueError)
+async def issue_error_handler(_request, exc: IssueError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"error": {
+            "code": exc.code,
+            "field": exc.field,
+            "message": exc.message,
+        }},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def issue_request_validation_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """仅对 POST /v1/issue-810 把 Pydantic 校验错误归一为带字段与错误码的 422；
+    其余接口保持 FastAPI 默认 422 结构。"""
+    if request.url.path != "/v1/issue-810":
+        return JSONResponse(
+            status_code=422, content={"detail": jsonable_encoder(exc.errors())})
+
+    err = exc.errors()[0]
+    err_type = err.get("type", "")
+    loc = [str(p) for p in err.get("loc", []) if p not in ("body",)]
+    field = ".".join(loc) if loc else None
+    if err_type in ("missing", "value_error.missing"):
+        code = "ISSUE_MISSING"
+        message = f"缺少必填字段: {field or '请求体'}"
+    elif err_type == "json_invalid":
+        code = "ISSUE_INVALID_JSON"
+        field = None
+        message = "请求体不是合法 JSON"
+    elif err_type == "string_type":
+        code = "ISSUE_NOT_STRING"
+        message = f"{field or '字段'}必须为字符串"
+    elif err_type == "list_type":
+        code = "ISSUE_NOT_ARRAY"
+        message = f"{field or '字段'}必须为数组"
+    elif err_type in ("model_type", "dict_type", "model_attributes_type"):
+        code = "ISSUE_INVALID_OBJECT"
+        message = f"{field or '请求体'}必须为 JSON 对象"
+    else:
+        code = "ISSUE_INVALID"
+        message = err.get("msg", "请求体不合法")
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": code, "field": field, "message": message}},
     )
 
 
@@ -354,6 +409,71 @@ async def acknowledge_status(req: AckStatusRequest) -> AckStatusResponse:
     return AckStatusResponse(
         items=[AckStatusItemOut(st02=item.st02, status=item.status)
                for item in items])
+
+
+# ---------- POST /v1/issue-810 ----------
+
+
+class IssueLineModel(BaseModel):
+    it101: str = Field(..., description="IT101 行号（非空、唯一）")
+    it102: str = Field(..., description="IT102 数量（十进制字符串，正，至多 3 位小数）")
+    it104: str = Field(..., description="IT104 单价（十进制字符串，非负，至多 4 位小数）")
+
+
+class Issue810Request(BaseModel):
+    isa05: str = Field(..., description="ISA05 发送方限定符（恰好 2 字符）")
+    isa06: str = Field(..., description="ISA06 发送方标识（1～15 字符，左对齐空格补 15）")
+    isa07: str = Field(..., description="ISA07 接收方限定符（恰好 2 字符）")
+    isa08: str = Field(..., description="ISA08 接收方标识（1～15 字符，左对齐空格补 15）")
+    gs02: str = Field(..., description="GS02 应用发送方代码（1～15 字符）")
+    gs03: str = Field(..., description="GS03 应用接收方代码（1～15 字符）")
+    isa09: str = Field(..., description="ISA09 交换日期（6 位数字 YYMMDD）")
+    isa10: str = Field(..., description="ISA10 交换时间（4 位数字 HHMM）")
+    gs04: str = Field(..., description="GS04 功能组日期（8 位数字 CCYYMMDD）")
+    gs05: str = Field(..., description="GS05 功能组时间（4 位数字 HHMM）")
+    big01: str = Field(..., description="BIG01 发票日期（8 位数字 CCYYMMDD）")
+    isa13: str = Field(..., description="ISA13 交换控制号（恰好 9 位数字）")
+    gs06: str = Field(..., description="GS06 组控制号（1～9 字符）")
+    st02: str = Field(..., description="ST02 交易集控制号（1～9 字符）")
+    big02: str = Field(..., description="BIG02 发票号（1～22 字符）")
+    lines: list[IssueLineModel] = Field(..., description="1～100 行发票行")
+
+
+class Issue810Response(BaseModel):
+    edi_text: str = Field(..., description="ASC X12 004010 810 发票报文（ASCII，≤64 KiB）")
+    total_amount: int = Field(..., description="TDS01 总额，整数分（各行 ROUND_HALF_UP 之和）")
+
+
+@app.post(
+    "/v1/issue-810",
+    response_model=Issue810Response,
+    summary="将结构化发票数据开具为 004010 X12 810 报文",
+)
+async def issue_invoice(req: Issue810Request) -> Issue810Response:
+    result = issue_810(
+        isa05=req.isa05,
+        isa06=req.isa06,
+        isa07=req.isa07,
+        isa08=req.isa08,
+        gs02=req.gs02,
+        gs03=req.gs03,
+        isa09=req.isa09,
+        isa10=req.isa10,
+        gs04=req.gs04,
+        gs05=req.gs05,
+        big01=req.big01,
+        isa13=req.isa13,
+        gs06=req.gs06,
+        st02=req.st02,
+        big02=req.big02,
+        lines=[
+            IssueLine(line_id=l.it101, quantity=l.it102,
+                      unit_price=l.it104)
+            for l in req.lines
+        ],
+    )
+    return Issue810Response(
+        edi_text=result.edi_text, total_amount=result.total_amount)
 
 
 @app.get("/health", summary="存活探针")
